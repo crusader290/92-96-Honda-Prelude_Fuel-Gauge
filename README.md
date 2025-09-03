@@ -1,2 +1,2 @@
-# 92-96-Honda-Prelude_Fuel-Gauge
-Using Arduino Nano V3
+# 92-96 Honda Prelude Fuel Gauge
+Using Arduino Nano V3 and OLED display to replace the original.
