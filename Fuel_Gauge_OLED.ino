@@ -1,27 +1,26 @@
 #include <EEPROM.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8glib.h>
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 32
-#define OLED_RESET    -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// --- OLED SH1106 I2C ---
+U8GLIB_SH1106_128X64 u8g(U8G_I2C_OPT_NONE);
 
+// --- Fuel sender ---
 const int adcPin = A0;
-const float R1 = 10000.0;
+const float R1 = 10000.0; // voltage divider
 const float R2 = 5000.0;
 
-// 7-point nonlinear fuel table
+// --- Fuel lookup table (nonlinear) ---
 const int numPoints = 7;
 float R_table[numPoints] = {16, 32, 116, 152, 188, 239, 314};
 float F_table[numPoints] = {0, 5, 25, 50, 65, 85, 100};
 
+// --- EEPROM logging ---
 const unsigned long logInterval = 3600000; // 1 hour
 unsigned long lastLogTime = 0;
-int hourIndex = 0; // 0-23
+int hourIndex = 0;
 
-// Lookup function
+// --- Lookup function ---
 float lookupFuel(float R) {
   if (R <= R_table[0]) return F_table[0];
   if (R >= R_table[numPoints - 1]) return F_table[numPoints - 1];
@@ -34,27 +33,30 @@ float lookupFuel(float R) {
   return 0;
 }
 
-// Draw horizontal bar for fuel %
-void drawFuelBar(float fuelPercent) {
-  int barWidth = map(fuelPercent, 0, 100, 0, SCREEN_WIDTH);
-  display.fillRect(0, SCREEN_HEIGHT-8, barWidth, 8, SSD1306_WHITE);
+// --- Draw fuel display ---
+void drawFuel(float fuelPercent) {
+  int fuelRounded = round(fuelPercent); // round for display
+  u8g.firstPage();
+  do {
+    // Title
+    u8g.setFont(u8g_font_6x10);
+    u8g.drawStr(0, 12, "Fuel Decoder");
+
+    // Numeric fuel %
+    char buf[10];
+    sprintf(buf, "Fuel: %d%%", fuelRounded);
+    u8g.setFont(u8g_font_10x20);
+    u8g.drawStr(0, 40, buf);
+
+    // Horizontal bar
+    int barWidth = map(fuelRounded, 0, 100, 0, 128);
+    u8g.drawBox(0, 60, barWidth, 4); // 4 pixels tall
+  } while(u8g.nextPage());
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Fuel Decoder Started");
-
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 allocation failed");
-    while(true);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.println("Fuel Decoder");
-  display.display();
-  delay(1000);
+  Serial.println("Fuel Decoder SH1106 Initialized");
 }
 
 void loop() {
@@ -67,22 +69,12 @@ void loop() {
   float fuelPercent = lookupFuel(R_sending);
   fuelPercent = constrain(fuelPercent, 0, 100);
 
-  // --- Live Serial output ---
+  // --- Serial output (precise float) ---
   Serial.print("Fuel %: ");
   Serial.println(fuelPercent, 1);
 
-  // --- Update OLED ---
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.setTextSize(1);
-  display.println("Fuel Level:");
-  display.setTextSize(2);
-  display.setCursor(0,12);
-  display.print(fuelPercent, 1);
-  display.println("%");
-  display.setTextSize(1);
-  drawFuelBar(fuelPercent);
-  display.display();
+  // --- Update OLED (rounded) ---
+  drawFuel(fuelPercent);
 
   // --- Log hourly to EEPROM ---
   unsigned long currentMillis = millis();
@@ -98,7 +90,7 @@ void loop() {
     Serial.println(fuelByte);
 
     hourIndex++;
-    if (hourIndex >= 24) hourIndex = 0; // wrap around
+    if (hourIndex >= 24) hourIndex = 0;
   }
 
   // --- Serial command to dump 24-hour log ---
