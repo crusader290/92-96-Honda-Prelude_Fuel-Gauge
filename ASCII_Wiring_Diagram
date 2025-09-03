@@ -1,0 +1,30 @@
++12V (Car Battery)
+               |
+               |
+               +---------+
+               |         |
+               |         |
+           Fuel Sending  Low Fuel Light (ignored)
+             Unit
+          +--------+
+          |        |
+          |        |
+       YEL/GRN ----+---------------------+
+                   |                     |
+                   |                     |
+                   |                  R1 | 10kΩ
+                   |                     |
+                   |                     +----> A0 (Nano ADC)
+                   |                     |
+                   |                  R2 | 5kΩ
+                   |                     |
+                  GND -------------------+
+                  (Fuel tank chassis)
+                  
+Arduino Nano v3 Pinout:
+
+           +5V ------------------- OLED VCC
+           GND ------------------- OLED GND
+           A4 (SDA) ------------- OLED SDA
+           A5 (SCL) ------------- OLED SCL
+           A0 ------------------- Voltage divider midpoint
