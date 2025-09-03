@@ -3,7 +3,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// OLED configuration
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
 #define OLED_RESET    -1
@@ -20,7 +19,7 @@ float F_table[numPoints] = {0, 5, 25, 50, 65, 85, 100};
 
 const unsigned long logInterval = 3600000; // 1 hour
 unsigned long lastLogTime = 0;
-int hourIndex = 0; // 0-23 for 24 hours
+int hourIndex = 0; // 0-23
 
 // Lookup function
 float lookupFuel(float R) {
@@ -35,11 +34,16 @@ float lookupFuel(float R) {
   return 0;
 }
 
+// Draw horizontal bar for fuel %
+void drawFuelBar(float fuelPercent) {
+  int barWidth = map(fuelPercent, 0, 100, 0, SCREEN_WIDTH);
+  display.fillRect(0, SCREEN_HEIGHT-8, barWidth, 8, SSD1306_WHITE);
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Fuel Decoder Started");
 
-  // Initialize OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("SSD1306 allocation failed");
     while(true);
@@ -54,12 +58,12 @@ void setup() {
 }
 
 void loop() {
-  // Read ADC and convert to resistance
+  // --- Read ADC and convert to resistance ---
   int adc = analogRead(adcPin);
   float V_adc = (adc / 1023.0) * 5.0;
   float R_sending = (V_adc * R1) / (5.0 - V_adc);
 
-  // Lookup fuel %
+  // --- Lookup fuel %
   float fuelPercent = lookupFuel(R_sending);
   fuelPercent = constrain(fuelPercent, 0, 100);
 
@@ -70,13 +74,15 @@ void loop() {
   // --- Update OLED ---
   display.clearDisplay();
   display.setCursor(0,0);
+  display.setTextSize(1);
   display.println("Fuel Level:");
   display.setTextSize(2);
-  display.setCursor(0,15);
+  display.setCursor(0,12);
   display.print(fuelPercent, 1);
   display.println("%");
+  display.setTextSize(1);
+  drawFuelBar(fuelPercent);
   display.display();
-  display.setTextSize(1); // reset text size
 
   // --- Log hourly to EEPROM ---
   unsigned long currentMillis = millis();
@@ -92,7 +98,23 @@ void loop() {
     Serial.println(fuelByte);
 
     hourIndex++;
-    if (hourIndex >= 24) hourIndex = 0; // wrap around for next day
+    if (hourIndex >= 24) hourIndex = 0; // wrap around
+  }
+
+  // --- Serial command to dump 24-hour log ---
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'R' || cmd == 'r') {
+      Serial.println("24-hour Fuel Log:");
+      for (int i = 0; i < 24; i++) {
+        byte val = EEPROM.read(i);
+        Serial.print("Hour ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(val);
+      }
+      Serial.println("End of log");
+    }
   }
 
   delay(1000);
