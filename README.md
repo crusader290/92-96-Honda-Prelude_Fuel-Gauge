@@ -1,79 +1,84 @@
-# 🛠️ Honda Prelude Fuel Gauge (Arduino Nano + OLED)
+# 🛠️ Honda Prelude Fuel Gauge Tap (Arduino Nano + OLED)
 
-This project is an **Arduino Nano V3-based digital fuel gauge** that taps into the **fuel sender line** of a 1993 Honda Prelude (OBD1-era).  
-It uses a **47 kΩ / 22 kΩ resistor divider** and a **100 nF capacitor** for noise suppression, then displays the **fuel level** on a **128×64 SH1106 OLED** in a clean, functional style.
+An **Arduino Nano V3-based digital fuel gauge** for the **1993 Honda Prelude (OBD1-era)**.  
+This project taps the **fuel sender line** using a safe high-impedance divider and displays a **digital percentage + bar graph** on a **128×64 SH1106 OLED**.
 
 ---
 
 ## 🚗 What It Does
-- Reads the **fuel sender line voltage** safely from 12 V → 5 V range.  
-- Converts readings into a **fuel % (0–100%)**, scaled like the **Honda factory gauge** (E → H → F).  
+- Reads the **fuel sender line voltage** (12 V → scaled to safe ADC range).  
+- Models the cluster’s **bimetallic gauge coil (~60 Ω)** feeding the sender.  
+- Converts sender line voltage into **fuel percentage** like Honda’s factory gauge.  
 - Displays:
-  - **Large %** (rounded to 10s for stability)  
+  - **Large %** (rounded to 10s for readability)  
   - **Smooth fuel bar graph**  
-  - **ADC value** (top-right, raw 0–1023)  
-- Logs **hourly averaged ADC values** to EEPROM (24-slot ring buffer).  
+  - **ADC value** (top-right)  
+- Logs **hourly averaged ADC readings** to EEPROM (24-slot ring buffer).  
 
 ---
 
 ## 📟 Features
-- ✅ **10-sample averaging** + hardware filter → stable readings.  
+- ✅ **10-sample averaging** + optional 100 nF capacitor → stable readings.  
 - ✅ **¼-second updates** (no flicker).  
 - ✅ **EEPROM calibration anchors** for **Empty (E)**, **Half (H)**, and **Full (F)**.  
-- ✅ Each anchor can be **set, cleared, or defaulted individually**.  
-- ✅ **Fallback defaults** use typical Honda values:
-  - E ≈ 24 Ω, H ≈ 152 Ω, F ≈ 277 Ω  
-  - Assumes `R_PULLUP = 120 Ω` and `Vsupply = 12.5 V`.  
+- ✅ Anchors can be **set, cleared, or defaulted individually**.  
+- ✅ **Target calibration (`tNN`)**: instantly map the current voltage to a chosen % (e.g., `t85`).  
+- ✅ **Fallback defaults** use Honda-typical values with 60 Ω gauge coil model.  
 
 ---
 
 ## 🔌 Wiring
 - Arduino **GND** must be tied to **vehicle ground**.  
-- Optional: add a **1 kΩ series resistor** into A0 and a **5.1 V TVS/zener** for protection.  
+- Optional: add **1 kΩ series resistor** to A0 + **5.1 V TVS/zener** for protection.  
 
 ---
 
 ## 🖥️ Serial Commands
-Use the Arduino Serial Monitor to interact:
 
 | Command | Action |
 |---------|--------|
-| `e`     | Set **Empty (E)** to current sender line (mV) and save to EEPROM |
-| `h`     | Set **Half (H)** to current sender line (mV) and save |
-| `f`     | Set **Full (F)** to current sender line (mV) and save |
-| `!e`    | Clear **E** anchor (reverts to default, save) |
-| `!h`    | Clear **H** anchor (reverts to default, save) |
-| `!f`    | Clear **F** anchor (reverts to default, save) |
-| `d`     | Re-derive **any unset anchors** from defaults (keep user-set) |
-| `p`     | Print current active anchors and user-set flags |
-| `O`     | Print **derived defaults** (E/H/F in mV from constants) |
+| `e`     | Set **Empty (E)** to current voltage (save to EEPROM) |
+| `h`     | Set **Half (H)** to current voltage (save) |
+| `f`     | Set **Full (F)** to current voltage (save) |
+| `!e`    | Clear **E** → revert to default |
+| `!h`    | Clear **H** → revert to default |
+| `!f`    | Clear **F** → revert to default |
+| `d`     | Re-derive **any unset anchors** from defaults |
+| `p`     | Print current anchors + user-set flags |
+| `O`     | Print **derived defaults** (coil model E/H/F in mV) |
+| `tNN`   | **Target calibration**: map current reading to **NN%** (e.g., `t85`) |
 
 ---
 
 ## 📊 Display
 - **Center:** Fuel % (rounded to nearest 10%)  
-- **Bar Graph:** Smooth fill proportional to fuel %  
+- **Bar Graph:** Smooth proportional fill  
 - **Bottom:** `E` and `F` labels  
-- **Top-right:** ADC raw value (0–1023)  
+- **Top-right:** Raw ADC value (0–1023)  
 
 ---
 
 ## 🗂️ EEPROM
-- Stores **anchors** (E/H/F mV values + flags).  
+- Stores **anchors (E/H/F)** + **flags** for which are user-set.  
 - Stores **24-hour rolling log** of averaged ADC readings.  
 
 ---
 
 ## ⚙️ Notes
-- Defaults assume: `R_PULLUP = 120 Ω`, `Vsupply = 12.5 V`.  
-- Calibrate in-car for accuracy: set **E** when nearly empty, **H** around half tank, and **F** when brimmed.  
-- You may set any combination (e.g., only `f` to force Full = 100%).  
-- Safe high-impedance tap — does **not affect cluster operation**.
+- **Defaults** assume:  
+  - Gauge coil: `~60 Ω`  
+  - Supply: `12.5 V` (engine off)  
+  - Sender ranges: **E ≈ 24 Ω**, **H ≈ 152 Ω**, **F ≈ 277 Ω**  
+- In real cars, values drift with charging voltage (~13.8 V) and coil variation.  
+- Use **`e`/`h`/`f`** for accurate calibration, or **`tNN`** for fast correction.  
+- Safe high-impedance tap — **does not affect cluster operation**.  
 
 ---
 
 ## 📸 Example Output (Serial)
 
-ADC=265  Line=4060 mV  Fuel=20% Anchors (mV): E=2080 H=6990 F=8710 User-set flags: E - F
+Prelude fuel sender tap via 47k/22k + 100nF. Calibration OPTIONAL. Set anchors individually: 'e','h','f'. Clear: '!e','!h','!f'. 'd' re-derive unset. 'p' print current anchors, 'O' print defaults (coil model). 'tNN' fit current reading to NN%.
+
+ADC=265  Line=4060 mV  Fuel=20% Anchors (mV): E=3571 H=8962 F=10274 User-set flags: - - -
 
 ---
