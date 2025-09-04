@@ -68,6 +68,27 @@ void loadCal(){
   }
 }
 
+// --- Non-blocking serial helpers ---
+bool readNextCharWithTimeout(char &out, unsigned long timeout_ms = 150) {
+  unsigned long start = millis();
+  while (millis() - start < timeout_ms) {
+    if (Serial.available()) {
+      out = Serial.read();
+      return true;
+    }
+  }
+  return false; // timed out
+}
+
+void flushLineEndings() {
+  // eat CR/LF and spaces
+  while (Serial.available()) {
+    char c = Serial.peek();
+    if (c == '\r' || c == '\n' || c == ' ') { Serial.read(); }
+    else break;
+  }
+}
+
 // Clear one anchor back to default and persist
 void clearAnchor(char which){
   if (which=='e' || which=='E'){
@@ -82,66 +103,14 @@ void clearAnchor(char which){
     cal.flags &= ~0x04;
     cal.F_mV = ohmsToLine_mV(R_F_OHMS);
     Serial.print(F("Cleared F -> default ")); Serial.print(cal.F_mV); Serial.println(F(" mV (saved)"));
-  }
-  cal.valid = 0xA5;
-  saveCal();
-}
-
-// Fit the current reading to a target % (0..100) by shifting one anchor:
-// - If target <= 50: fit in E..H segment by moving H.
-// - If target > 50:  fit in H..F segment by moving F.
-// Saves to EEPROM and sets the corresponding user-flag.
-void fitCurrentToTarget(uint16_t v_line_mV, uint8_t targetPct) {
-  if (targetPct > 100) targetPct = 100;
-
-  // Ensure H sits between E and F first
-  int32_t E = cal.E_mV, H = cal.H_mV, F = cal.F_mV;
-  bool asc = (F >= E);
-  if (asc) { if (H < E) H = E; if (H > F) H = F; }
-  else     { if (H > E) H = E; if (H < F) H = F; }
-
-  if (targetPct <= 50) {
-    // v_line in E..H: targetPct = ((v - E)/(H - E)) * 50
-    // Solve for H so that current v maps to target:
-    // target = ((v - E)*50)/(H - E)  =>  H - E = ((v - E)*50)/target  =>  H = E + ((v - E)*50)/target
-    int32_t v = v_line_mV;
-    if (v <= E) v = E + 1; // avoid degenerate
-    if (targetPct == 0) targetPct = 1;
-    int32_t Hnew = E + ((int32_t)(v - E) * 50L) / targetPct;
-    if (asc) {
-      if (Hnew < E + 1) Hnew = E + 1;
-      if (Hnew > F - 1) Hnew = F - 1;
-    } else {
-      if (Hnew > E - 1) Hnew = E - 1;
-      if (Hnew < F + 1) Hnew = F + 1;
-    }
-    cal.H_mV = (uint16_t)clamp16(Hnew);
-    cal.flags |= 0x02;
-    Serial.print(F("Fitted current to ")); Serial.print(targetPct); Serial.println(F("% via H (saved)"));
   } else {
-    // v_line in H..F: targetPct = 50 + ((v - H)/(F - H)) * 50
-    // => target-50 = ((v - H)*50)/(F - H)  =>  F - H = ((v - H)*50)/(target-50)  =>  F = H + ((v - H)*50)/(target-50)
-    int32_t v = v_line_mV;
-    if (v <= H) v = H + 1;
-    uint8_t t = targetPct - 50;
-    if (t == 0) t = 1;
-    int32_t Fnew = H + ((int32_t)(v - H) * 50L) / t;
-    if (asc) {
-      if (Fnew < H + 1) Fnew = H + 1;
-      if (Fnew < E + 2) Fnew = E + 2;
-    } else {
-      if (Fnew > H - 1) Fnew = H - 1;
-      if (Fnew > E - 2) Fnew = E - 2;
-    }
-    cal.F_mV = (uint16_t)clamp16(Fnew);
-    cal.flags |= 0x04;
-    Serial.print(F("Fitted current to ")); Serial.print(targetPct); Serial.println(F("% via F (saved)"));
+    Serial.println(F("Unknown clear target; use !e, !h, or !f"));
+    return;
   }
   cal.valid = 0xA5;
   saveCal();
 }
 
-// Log one averaged ADC value (uint16_t) each hour into a 24-slot ring
 void logADCHourly(uint16_t adcAvg){
   int addr = EE_ADDR_LOG + (logIndex*sizeof(uint16_t));
   EEPROM.update(addr,   (uint8_t)(adcAvg & 0xFF));
@@ -149,7 +118,6 @@ void logADCHourly(uint16_t adcAvg){
   logIndex = (logIndex+1)%24;
 }
 
-// Read A0 → averaged ADC → sender line mV
 uint16_t readSenderLine_mV(uint16_t &adc_out){
   const uint8_t N=10; // 10-sample average; add 100nF at A0 in hardware
   uint32_t sum=0;
@@ -161,11 +129,23 @@ uint16_t readSenderLine_mV(uint16_t &adc_out){
   return clamp16(Vline_mV);
 }
 
-// Piecewise-linear mapping using E/H/F voltage anchors (handles polarity).
-// E..H → 0..50%, H..F → 50..100%. Works whether voltage rises or falls with fuel.
+// ---------- Mapping: H optional ----------
+// If H (bit1) is NOT user-set, use linear E<->F.
+// If H is user-set, use piecewise E->H (0..50%) and H->F (50..100%).
 uint8_t fuelPercentFromLine(uint16_t v_mV){
   int32_t E=cal.E_mV, H=cal.H_mV, F=cal.F_mV;
-  bool asc=(F>=E);
+  bool H_active = (cal.flags & 0x02);
+  bool asc = (F >= E);
+
+  // Linear 2-point mapping if H not active
+  if (!H_active) {
+    int32_t span = (int32_t)F - (int32_t)E;
+    if (span == 0) return 0;
+    int32_t pct = ((int32_t)v_mV - E) * 100L / span;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return (uint8_t)pct;
+  }
 
   // Ensure H sits between E and F
   if (asc){ if(H<E)H=E; if(H>F)H=F; }
@@ -195,6 +175,52 @@ uint8_t fuelPercentFromLine(uint16_t v_mV){
   }
   if (pct<0) pct=0; if (pct>100) pct=100;
   return (uint8_t)pct;
+}
+
+// -------- Fit current reading to target % (H optional aware) --------
+// - If H active: target<=50 adjusts H; target>50 adjusts F.
+// - If H inactive: adjust F so linear E<->F passes through target at current V.
+void fitCurrentToTarget(uint16_t v_line_mV, uint8_t targetPct) {
+  if (targetPct > 100) targetPct = 100;
+  int32_t E = cal.E_mV, H = cal.H_mV, F = cal.F_mV;
+  bool H_active = (cal.flags & 0x02);
+  bool asc = (F >= E);
+
+  if (!H_active) {
+    if (targetPct == 0) targetPct = 1; // avoid div0
+    int32_t v = v_line_mV;
+    if ((asc && v <= E) || (!asc && v >= E)) v = E + (asc ? 1 : -1);
+    int32_t Fnew = E + ((int32_t)(v - E) * 100L) / targetPct;
+    if (asc) { if (Fnew <= E + 1) Fnew = E + 1; }
+    else     { if (Fnew >= E - 1) Fnew = E - 1; }
+    cal.F_mV = (uint16_t)clamp16(Fnew);
+    cal.flags |= 0x04; // F user-set
+    Serial.print(F("Fitted current to ")); Serial.print(targetPct); Serial.println(F("% via F (linear mode, saved)"));
+  } else {
+    if (targetPct <= 50) {
+      int32_t v = v_line_mV;
+      if (asc) { if (v <= E) v = E + 1; } else { if (v >= E) v = E - 1; }
+      if (targetPct == 0) targetPct = 1;
+      int32_t Hnew = E + ((int32_t)(v - E) * 50L) / targetPct;
+      if (asc) { if (Hnew < E + 1) Hnew = E + 1; if (Hnew > F - 1) Hnew = F - 1; }
+      else     { if (Hnew > E - 1) Hnew = E - 1; if (Hnew < F + 1) Hnew = F + 1; }
+      cal.H_mV = (uint16_t)clamp16(Hnew);
+      cal.flags |= 0x02; // H user-set
+      Serial.print(F("Fitted current to ")); Serial.print(targetPct); Serial.println(F("% via H (piecewise, saved)"));
+    } else {
+      uint8_t t = targetPct - 50; if (t == 0) t = 1;
+      int32_t v = v_line_mV;
+      if (asc) { if (v <= H) v = H + 1; } else { if (v >= H) v = H - 1; }
+      int32_t Fnew = H + ((int32_t)(v - H) * 50L) / t;
+      if (asc) { if (Fnew < H + 1) Fnew = H + 1; if (Fnew < E + 2) Fnew = E + 2; }
+      else     { if (Fnew > H - 1) Fnew = H - 1; if (Fnew > E - 2) Fnew = E - 2; }
+      cal.F_mV = (uint16_t)clamp16(Fnew);
+      cal.flags |= 0x04; // F user-set
+      Serial.print(F("Fitted current to ")); Serial.print(targetPct); Serial.println(F("% via F (piecewise, saved)"));
+    }
+  }
+  cal.valid = 0xA5;
+  saveCal();
 }
 
 // ----------------- OLED -----------------
@@ -246,7 +272,8 @@ void printStatus() {
   Serial.print(F("User-set flags: "));
   Serial.print((cal.flags & 0x01) ? F("E ") : F("- "));
   Serial.print((cal.flags & 0x02) ? F("H ") : F("- "));
-  Serial.println((cal.flags & 0x04) ? F("F") : F("-"));
+  Serial.println((cal.flags & 0x04) ? F("F") : F("- "));
+  Serial.println((cal.flags & 0x02) ? F("H mode: ACTIVE (piecewise)") : F("H mode: UNUSED (linear E<->F)"));
 }
 
 void printDefaults() {
@@ -265,9 +292,8 @@ void printDefaults() {
 void setup(){
   Serial.begin(115200);
   loadCal();
-  Serial.println(F("Prelude fuel sender tap via 47k/22k + 100nF. Calibration OPTIONAL."));
-  Serial.println(F("Set anchors individually: 'e','h','f'. Clear: '!e','!h','!f'. 'd' re-derive unset."));
-  Serial.println(F("'p' print current anchors, 'O' print defaults (coil model). 'tNN' fit current reading to NN%."));
+  Serial.println(F("Prelude fuel sender tap via 47k/22k + 100nF. H is OPTIONAL (linear if unset)."));
+  Serial.println(F("Commands: e/h/f set live; !e/!h/!f clear; d derive unset; p print; O defaults; tNN target %."));
   printStatus();
 }
 
@@ -278,9 +304,12 @@ void loop(){
   if (now-lastUpdate>=250){
     lastUpdate=now;
 
-    // Handle serial commands
-    if (Serial.available()){
-      char c=Serial.read();
+    // ---- Non-blocking serial command handling ----
+    flushLineEndings();
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\r' || c == '\n' || c == ' ') continue; // ignore whitespace
+
       if (c=='e'||c=='E'){
         uint16_t d; cal.E_mV=readSenderLine_mV(d); cal.flags|=0x01; cal.valid=0xA5; saveCal();
         Serial.print(F("EMPTY set @ ")); Serial.print(cal.E_mV); Serial.println(F(" mV (saved)"));
@@ -290,40 +319,44 @@ void loop(){
       } else if (c=='f'||c=='F'){
         uint16_t d; cal.F_mV=readSenderLine_mV(d); cal.flags|=0x04; cal.valid=0xA5; saveCal();
         Serial.print(F("FULL  set @ ")); Serial.print(cal.F_mV); Serial.println(F(" mV (saved)"));
-      } else if (c=='!'){ // clear one anchor
-        while(!Serial.available()){}
-        char t=Serial.read();
-        clearAnchor(t);
+      } else if (c=='!'){ // clear one anchor with timeout
+        char t;
+        if (readNextCharWithTimeout(t)) {
+          clearAnchor(t);
+        } else {
+          Serial.println(F("Ignored lone '!' (no e/h/f)"));
+        }
       } else if (c=='d'||c=='D'){
         setDefaultsForUnset(); cal.valid=0xA5; saveCal();
         Serial.println(F("Re-derived defaults for any UNSET anchors (kept user-set)."));
       } else if (c=='p'||c=='P'){
         printStatus();
-      } else if (c=='O'){ // capital 'O' -> print defaults
+      } else if (c=='O'){ // capital 'O'
         printDefaults();
-      } else if (c=='t' || c=='T'){ // fit current to NN%
-        // read up to two digits for NN
-        while(!Serial.available()){}
-        char d1 = Serial.read();
+      } else if (c=='t' || c=='T'){ // target NN% with timeout
+        char d1, d2;
         int target = -1;
-        if (d1 >= '0' && d1 <= '9'){
-          while(!Serial.available()){}
-          char d2 = Serial.read();
-          if (d2 >= '0' && d2 <= '9'){
-            target = (d1 - '0')*10 + (d2 - '0');
-          } else {
-            target = (d1 - '0');
+        if (readNextCharWithTimeout(d1)) {
+          if (d1 >= '0' && d1 <= '9') {
+            if (readNextCharWithTimeout(d2, 50) && (d2 >= '0' && d2 <= '9')) {
+              target = (d1 - '0')*10 + (d2 - '0');
+            } else {
+              target = (d1 - '0');
+            }
           }
         }
-        if (target >= 0){
+        if (target >= 0) {
+          if (target > 100) target = 100;
           uint16_t adcAvg; uint16_t v_line = readSenderLine_mV(adcAvg);
           fitCurrentToTarget(v_line, (uint8_t)target);
           Serial.print(F("Current mapped to ")); Serial.print(target); Serial.println(F("% at this voltage."));
         } else {
           Serial.println(F("tNN usage: send 't85' to map current to 85%."));
         }
+      } else {
+        // Unknown command; ignore
       }
-      while (Serial.available()) Serial.read();
+      flushLineEndings();
     }
 
     // Read & display
