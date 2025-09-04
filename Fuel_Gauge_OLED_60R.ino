@@ -37,6 +37,9 @@ unsigned long lastLog = 0;
 uint8_t logIndex = 0;                             // RAM-only ring index
 const int EE_ADDR_LOG = sizeof(CalData);          // logs after cal block
 
+// ---- Heartbeat (blinks at 4 Hz) ----
+bool heartbeat = false;
+
 // ---------- Helpers ----------
 static inline uint16_t clamp16(uint32_t x){ return (x>65535UL)?65535U:(uint16_t)x; }
 
@@ -261,6 +264,11 @@ void drawFuelOLED(uint8_t fuelSmooth, uint16_t adcVal){
     int adcX=128-u8g.getStrWidth(adcBuf)-2;
     u8g.drawStr(adcX, 10, adcBuf);
 
+    // Heartbeat dot (blinks at 4 Hz) in top-left
+    if (heartbeat) {
+      u8g.drawStr(2, 10, "*");
+    }
+
   }while(u8g.nextPage());
 }
 
@@ -272,7 +280,7 @@ void printStatus() {
   Serial.print(F("User-set flags: "));
   Serial.print((cal.flags & 0x01) ? F("E ") : F("- "));
   Serial.print((cal.flags & 0x02) ? F("H ") : F("- "));
-  Serial.println((cal.flags & 0x04) ? F("F") : F("- "));
+  Serial.println((cal.flags & 0x04) ? F("F ") : F("- "));
   Serial.println((cal.flags & 0x02) ? F("H mode: ACTIVE (piecewise)") : F("H mode: UNUSED (linear E<->F)"));
 }
 
@@ -364,6 +372,9 @@ void loop(){
     uint16_t v_line=readSenderLine_mV(adcAvg);
     uint8_t fuelSmooth=fuelPercentFromLine(v_line);
     drawFuelOLED(fuelSmooth, adcAvg);
+
+    // Toggle heartbeat each update (for blink)
+    heartbeat = !heartbeat;
 
     // Debug line
     Serial.print(F("ADC=")); Serial.print(adcAvg);
