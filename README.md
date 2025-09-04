@@ -1,4 +1,4 @@
-# 🛠️ Honda Prelude Fuel Gauge Tap (Arduino Nano + OLED)
+# 🛠️ Honda Prelude Fuel Gauge (Arduino Nano + OLED)
 
 An **Arduino Nano V3-based digital fuel gauge** for the **1993 Honda Prelude (OBD1-era)**.  
 This project safely taps the **fuel sender line** with a high-impedance divider and displays a **digital percentage + bar graph** on a **128×64 SH1106 OLED**.
