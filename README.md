@@ -7,7 +7,7 @@ This project safely taps the **fuel sender line** with a high-impedance divider 
 
 ## 🚗 What It Does
 - Reads the **fuel sender line voltage** (12 V → scaled for ADC).
-- Reads the VCC from the internal 1.1 V reference.
+- Reads the Nano VCC from the internal 1.1 V reference.
 - Models the cluster’s **bimetallic gauge coil (~60 Ω)** feeding the sender.  
 - Converts line voltage into **fuel percentage** similar to Honda’s factory gauge.  
 - Displays:
