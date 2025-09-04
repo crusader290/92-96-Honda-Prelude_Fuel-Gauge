@@ -126,10 +126,79 @@ uint16_t readSenderLine_mV(uint16_t &adc_out, uint16_t &vadc_out){
   return clamp16(Vline_mV);
 }
 
-// ---------- Mapping + fitCurrentToTarget + drawFuelOLED + printStatus + printDefaults ----------
-// (KEEP your existing implementations unchanged)
+// ---------- Mapping + Display ----------
 
-...  // your unchanged functions go here
+uint8_t fuelPercentFromLine(uint16_t v_line) {
+  // Handle optional H calibration
+  if (cal.flags & 0x02) {
+    // Piecewise: E->H, H->F
+    if (v_line <= cal.H_mV) {
+      int32_t num = (int32_t)(v_line - cal.E_mV) * 50;
+      int32_t den = (int32_t)(cal.H_mV - cal.E_mV);
+      if (den <= 0) return 0;
+      return (uint8_t) constrain(num / den, 0, 50);
+    } else {
+      int32_t num = (int32_t)(v_line - cal.H_mV) * 50;
+      int32_t den = (int32_t)(cal.F_mV - cal.H_mV);
+      if (den <= 0) return 100;
+      return (uint8_t) constrain(50 + num / den, 50, 100);
+    }
+  } else {
+    // Linear E->F
+    int32_t num = (int32_t)(v_line - cal.E_mV) * 100;
+    int32_t den = (int32_t)(cal.F_mV - cal.E_mV);
+    if (den <= 0) return 0;
+    return (uint8_t) constrain(num / den, 0, 100);
+  }
+}
+
+void drawFuelOLED(uint8_t fuelPercent, uint16_t adcAvg) {
+  u8g.firstPage();
+  do {
+    // Title
+    u8g.setFont(u8g_font_6x13B);
+    u8g.drawStr(0, 10, "Fuel Gauge");
+
+    // Bar graph
+    int barWidth = map(fuelPercent, 0, 100, 0, 120);
+    u8g.drawFrame(0, 20, 128, 20);
+    u8g.drawBox(0, 20, barWidth, 20);
+
+    // Percent text
+    char buf[16];
+    sprintf(buf, "%3d%%", fuelPercent);
+    u8g.drawStr(0, 55, buf);
+
+    // Raw ADC debug
+    sprintf(buf, "ADC:%u", adcAvg);
+    u8g.drawStr(64, 55, buf);
+
+  } while (u8g.nextPage());
+}
+
+void printStatus() {
+  Serial.println(F("---- Calibration Status ----"));
+  Serial.print(F("E anchor = ")); Serial.print(cal.E_mV); Serial.println(F(" mV"));
+  Serial.print(F("H anchor = ")); Serial.print(cal.H_mV); Serial.println(F(" mV"));
+  Serial.print(F("F anchor = ")); Serial.print(cal.F_mV); Serial.println(F(" mV"));
+  Serial.print(F("Flags = ")); Serial.println(cal.flags, BIN);
+  Serial.print(F("Valid = ")); Serial.println(cal.valid, HEX);
+  Serial.print(F("Current Vcc = ")); Serial.print(ADC_REF_mV); Serial.println(F(" mV"));
+}
+
+void printDefaults() {
+  Serial.println(F("---- Default Model Anchors ----"));
+  Serial.print(F("E (24Ω) = ")); Serial.print(ohmsToLine_mV(R_E_OHMS)); Serial.println(F(" mV"));
+  Serial.print(F("H (152Ω) = ")); Serial.print(ohmsToLine_mV(R_H_OHMS)); Serial.println(F(" mV"));
+  Serial.print(F("F (277Ω) = ")); Serial.print(ohmsToLine_mV(R_F_OHMS)); Serial.println(F(" mV"));
+}
+
+// Simulate targeting a % fuel (demo only)
+void fitCurrentToTarget(uint8_t targetPercent) {
+  Serial.print(F("Simulating target fuel = "));
+  Serial.print(targetPercent);
+  Serial.println(F("% (no physical output driven)"));
+}
 
 // -------------- Setup / Loop --------------
 void setup(){
@@ -166,14 +235,32 @@ void loop(){
       char c = Serial.read();
       if (c == '\r' || c == '\n' || c == ' ') continue;
 
-      if (c=='e'||c=='E'){ ... }
-      else if (c=='h'||c=='H'){ ... }
-      else if (c=='f'||c=='F'){ ... }
+      if (c=='e'||c=='E'){ 
+        uint16_t adc,v; uint16_t vline=readSenderLine_mV(adc,v);
+        cal.E_mV=vline; cal.flags|=0x01; saveCal();
+        Serial.print(F("Set E anchor = ")); Serial.print(vline); Serial.println(F(" mV (saved)"));
+      }
+      else if (c=='h'||c=='H'){ 
+        uint16_t adc,v; uint16_t vline=readSenderLine_mV(adc,v);
+        cal.H_mV=vline; cal.flags|=0x02; saveCal();
+        Serial.print(F("Set H anchor = ")); Serial.print(vline); Serial.println(F(" mV (saved)"));
+      }
+      else if (c=='f'||c=='F'){ 
+        uint16_t adc,v; uint16_t vline=readSenderLine_mV(adc,v);
+        cal.F_mV=vline; cal.flags|=0x04; saveCal();
+        Serial.print(F("Set F anchor = ")); Serial.print(vline); Serial.println(F(" mV (saved)"));
+      }
       else if (c=='!'){ char t; if (readNextCharWithTimeout(t)) clearAnchor(t); }
       else if (c=='d'||c=='D'){ setDefaultsForUnset(); cal.valid=0xA5; saveCal(); Serial.println(F("Re-derived defaults.")); }
       else if (c=='p'||c=='P'){ printStatus(); }
       else if (c=='O'){ printDefaults(); }
-      else if (c=='t' || c=='T'){ ... } 
+      else if (c=='t' || c=='T'){ 
+        char d1,d2; 
+        if (readNextCharWithTimeout(d1) && readNextCharWithTimeout(d2)) {
+          uint8_t tgt=(d1-'0')*10+(d2-'0');
+          fitCurrentToTarget(tgt);
+        }
+      } 
       else if (c=='v' || c=='V'){ 
         Serial.print(F("Measured Vcc = "));
         Serial.print(ADC_REF_mV);
