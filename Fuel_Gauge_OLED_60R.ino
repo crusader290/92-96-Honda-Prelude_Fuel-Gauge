@@ -1,285 +1,330 @@
 #include <EEPROM.h>
-#include <U8glib.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 
 // ---------------- OLED ----------------
-U8GLIB_SH1106_128X64 u8g(U8G_I2C_OPT_NONE);
+U8G2_SSD1309_128X64_NONAME0_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 // ----------- Divider (tap) -----------
-const uint32_t R_TOP    = 47000UL; // to sender line (from cluster)
-const uint32_t R_BOTTOM = 22000UL; // to GND
+const uint32_t R_TOP    = 47000UL;
+const uint32_t R_BOTTOM = 10000UL;
+const float DIVIDER_RATIO = (float)R_BOTTOM / (R_TOP + R_BOTTOM);
 
-// -------- Cluster gauge coil model (defaults) --------
-#define R_SERIES_OHMS 60U      // Gauge coil effective series resistance (default model)
-#define V_SUPPLY_mV   12500U   // Key-on engine-off; try 13800 for charging voltage
+// -------- Tank Capacity -----------
+#define TANK_LITERS 60
 
-// -------- Honda's average sender resistance anchors --------
-#define R_E_OHMS  24U   // Empty avg (16–32 Ω → ~24 Ω)
-#define R_H_OHMS 152U   // Half  avg (116–188 Ω → ~152 Ω)
-#define R_F_OHMS 277U   // Full  avg (239–314 Ω → ~277 Ω)
+// -------- Calibration structures --------
+struct CalPoint {
+  uint16_t mV;     // sender voltage
+  uint8_t liters;  // liters at that voltage
+  bool isDefault;  // default vs user-set
+};
 
-// ---- Calibration/anchors in EEPROM ----
+#define MAX_CAL_POINTS 16
 struct CalData {
-  uint16_t E_mV;  
-  uint16_t H_mV;  
-  uint16_t F_mV;  
-  uint8_t  flags; 
-  uint8_t  valid; 
+  CalPoint points[MAX_CAL_POINTS];
+  uint8_t count;
+  uint8_t valid;
 } cal;
 
 const int EE_ADDR_CAL = 0;
-
-// ---- Heartbeat (blinks at 4 Hz) ----
-bool heartbeat = false;
+uint32_t ADC_REF_mV = 3300UL; // Nano R4 ADC reference (3.3V)
 
 // ---------- Helpers ----------
 static inline uint16_t clamp16(uint32_t x){ return (x>65535UL)?65535U:(uint16_t)x; }
+long readVcc_mV() { return 3300; } // fixed for Nano R4
 
-// --- Measure actual Vcc (in mV) using internal 1.1V reference ---
-long readVcc_mV() {
-  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1); 
-  delay(2); 
-  ADCSRA |= _BV(ADSC); 
-  while (bit_is_set(ADCSRA, ADSC)); 
-  uint16_t result = ADC;
-  long vcc = 1125300L / result; 
-  return vcc; 
-}
-
-uint32_t ADC_REF_mV = 5000UL; // updated dynamically
-
-// Default anchor calculation using *coil model*
-uint16_t ohmsToLine_mV(uint16_t R_ohms){
-  uint32_t num=(uint32_t)V_SUPPLY_mV*(uint32_t)R_ohms;
-  uint32_t den=(uint32_t)R_SERIES_OHMS + (uint32_t)R_ohms;
-  return clamp16(num/den);
-}
-
-void setDefaultsForUnset() {
-  if (!(cal.flags & 0x01)) cal.E_mV = ohmsToLine_mV(R_E_OHMS);
-  if (!(cal.flags & 0x02)) cal.H_mV = ohmsToLine_mV(R_H_OHMS);
-  if (!(cal.flags & 0x04)) cal.F_mV = ohmsToLine_mV(R_F_OHMS);
-}
-
+// ---------- EEPROM ----------
 void saveCal(){ EEPROM.put(EE_ADDR_CAL, cal); }
 void loadCal(){
   EEPROM.get(EE_ADDR_CAL, cal);
   if (cal.valid != 0xA5) {
-    cal.flags = 0;
-    setDefaultsForUnset();
+    cal.count = 0;
     cal.valid = 0xA5;
     saveCal();
-  } else {
-    setDefaultsForUnset();
   }
 }
 
-// --- Non-blocking serial helpers ---
-bool readNextCharWithTimeout(char &out, unsigned long timeout_ms = 150) {
-  unsigned long start = millis();
-  while (millis() - start < timeout_ms) {
-    if (Serial.available()) {
-      out = Serial.read();
-      return true;
+// ---------- Calibration ----------
+void addCalibration(uint16_t mV, uint8_t liters) {
+  // Check for existing user-set at this liter level
+  for (uint8_t i=0; i<cal.count; i++) {
+    if (cal.points[i].liters == liters && !cal.points[i].isDefault) {
+      cal.points[i].mV = mV;  // overwrite voltage
+      saveCal();
+      Serial.print(F("Updated calibration: "));
+      Serial.print(mV); Serial.print(F(" mV = "));
+      Serial.print(liters); Serial.println(F(" L [SET] (replaced old)"));
+      return;
     }
   }
-  return false;
-}
 
-void flushLineEndings() {
-  while (Serial.available()) {
-    char c = Serial.peek();
-    if (c == '\r' || c == '\n' || c == ' ') { Serial.read(); }
-    else break;
-  }
-}
-
-void clearAnchor(char which){
-  if (which=='e' || which=='E'){
-    cal.flags &= ~0x01;
-    cal.E_mV = ohmsToLine_mV(R_E_OHMS);
-    Serial.print(F("Cleared E -> default ")); Serial.print(cal.E_mV); Serial.println(F(" mV (saved)"));
-  } else if (which=='h' || which=='H'){
-    cal.flags &= ~0x02;
-    cal.H_mV = ohmsToLine_mV(R_H_OHMS);
-    Serial.print(F("Cleared H -> default ")); Serial.print(cal.H_mV); Serial.println(F(" mV (saved)"));
-  } else if (which=='f' || which=='F'){
-    cal.flags &= ~0x04;
-    cal.F_mV = ohmsToLine_mV(R_F_OHMS);
-    Serial.print(F("Cleared F -> default ")); Serial.print(cal.F_mV); Serial.println(F(" mV (saved)"));
+  // If not found, add a new one
+  if (cal.count < MAX_CAL_POINTS) {
+    cal.points[cal.count].mV = mV;
+    cal.points[cal.count].liters = liters;
+    cal.points[cal.count].isDefault = false;
+    cal.count++;
+    // sort by voltage
+    for (uint8_t i=0; i<cal.count; i++) {
+      for (uint8_t j=i+1; j<cal.count; j++) {
+        if (cal.points[j].mV < cal.points[i].mV) {
+          CalPoint tmp = cal.points[i];
+          cal.points[i] = cal.points[j];
+          cal.points[j] = tmp;
+        }
+      }
+    }
+    saveCal();
+    Serial.print(F("Added calibration: ")); 
+    Serial.print(mV); Serial.print(F(" mV = "));
+    Serial.print(liters); Serial.println(F(" L [SET]"));
   } else {
-    Serial.println(F("Unknown clear target; use !e, !h, or !f"));
-    return;
+    Serial.println(F("Max calibration points reached."));
   }
+}
+
+void loadHondaDefaults() {
+  cal.count = 3;
+
+  cal.points[0] = {620, 0, true};   // Empty
+  cal.points[1] = {1570, 30, true}; // Half
+  cal.points[2] = {1800, 60, true}; // Full
+
   cal.valid = 0xA5;
   saveCal();
 }
 
-// Reads ADC, returns line voltage (mV). Also outputs raw ADC and pin voltage.
+void resetCalibration() {
+  loadHondaDefaults();   // wipes old data + loads defaults
+  Serial.println(F("Calibration reset to Honda defaults."));
+  printCalibration();    // prints the defaults right away
+}
+
+void clearAnchorByLiters(uint8_t liters) {
+  bool found = false;
+  for (uint8_t i=0; i<cal.count; i++) {
+    if (cal.points[i].liters == liters && !cal.points[i].isDefault) {
+      for (uint8_t j=i; j<cal.count-1; j++) {
+        cal.points[j] = cal.points[j+1];
+      }
+      cal.count--;
+      found = true;
+      break;
+    }
+  }
+  if (found) {
+    saveCal();
+    Serial.print(F("Cleared user-set anchor at ")); Serial.print(liters); Serial.println(F(" L"));
+  } else {
+    Serial.print(F("No user-set anchor found at ")); Serial.print(liters); Serial.println(F(" L"));
+  }
+}
+
+void clearAnchorByTag(char tag) {
+  if (tag == 'e' || tag == 'E') {
+    clearAnchorByLiters(0);
+  } else if (tag == 'h' || tag == 'H') {
+    clearAnchorByLiters(30);
+  } else if (tag == 'f' || tag == 'F') {
+    clearAnchorByLiters(60);
+  } else {
+    Serial.println(F("Unknown clear target; use !e, !h, !f, or !NN"));
+  }
+}
+
+// ---------- Interpolation ----------
+float litersFromLine(uint16_t v_line) {
+  if (cal.count < 2) return -1;
+
+  for (uint8_t i=0; i<cal.count-1; i++) {
+    if (v_line >= cal.points[i].mV && v_line <= cal.points[i+1].mV) {
+      float slope = (float)(cal.points[i+1].liters - cal.points[i].liters) /
+                    (float)(cal.points[i+1].mV - cal.points[i].mV);
+      return (v_line - cal.points[i].mV) * slope + cal.points[i].liters;
+    }
+  }
+
+  // Extrapolate below first
+  if (v_line < cal.points[0].mV && cal.count >= 2) {
+    float slope = (float)(cal.points[1].liters - cal.points[0].liters) /
+                  (float)(cal.points[1].mV - cal.points[0].mV);
+    return (v_line - cal.points[0].mV) * slope + cal.points[0].liters;
+  }
+  // Extrapolate above last
+  if (v_line > cal.points[cal.count-1].mV && cal.count >= 2) {
+    float slope = (float)(cal.points[cal.count-1].liters - cal.points[cal.count-2].liters) /
+                  (float)(cal.points[cal.count-1].mV - cal.points[cal.count-2].mV);
+    return (v_line - cal.points[cal.count-1].mV) * slope + cal.points[cal.count-1].liters;
+  }
+  return -1;
+}
+
+uint8_t fuelPercentFromLine(uint16_t v_line) {
+  float liters = litersFromLine(v_line);
+  if (liters < 0) liters = 0;
+  if (liters > TANK_LITERS) liters = TANK_LITERS;
+  return (uint8_t)((liters / TANK_LITERS) * 100.0f + 0.5f);
+}
+
+// ---------- ADC ----------
 uint16_t readSenderLine_mV(uint16_t &adc_out, uint16_t &vadc_out){
   const uint8_t N=10;
   uint32_t sum=0;
   for(uint8_t i=0;i<N;i++){ sum+=analogRead(A0); delay(2); }
   adc_out = (uint16_t)(sum/N);
 
-  vadc_out = (uint32_t)adc_out * ADC_REF_mV / 1023UL;
-  uint32_t Vline_mV = (uint32_t)vadc_out * (R_TOP+R_BOTTOM) / R_BOTTOM;
-  return clamp16(Vline_mV);
+  vadc_out = (uint32_t)adc_out * ADC_REF_mV / 4095UL; // 12-bit ADC
+  return vadc_out * (R_TOP+R_BOTTOM) / R_BOTTOM;
 }
 
-// ---------- Mapping + Display ----------
+// ---------- OLED ----------
+static const unsigned char fuelPump16x16_bits[] U8X8_PROGMEM = {
+  0x00,0x00, 0xF8,0x07, 0x08,0x04, 0x08,0x04,
+  0x18,0x06, 0xE8,0x05, 0x28,0x04, 0x30,0x06,
+  0xE0,0x07, 0x20,0x04, 0xE0,0x07, 0xE0,0x07,
+  0xE0,0x07, 0xE0,0x07, 0x00,0x00, 0x00,0x00
+};
 
-uint8_t fuelPercentFromLine(uint16_t v_line) {
-  // Handle optional H calibration
-  if (cal.flags & 0x02) {
-    // Piecewise: E->H, H->F
-    if (v_line <= cal.H_mV) {
-      int32_t num = (int32_t)(v_line - cal.E_mV) * 50;
-      int32_t den = (int32_t)(cal.H_mV - cal.E_mV);
-      if (den <= 0) return 0;
-      return (uint8_t) constrain(num / den, 0, 50);
-    } else {
-      int32_t num = (int32_t)(v_line - cal.H_mV) * 50;
-      int32_t den = (int32_t)(cal.F_mV - cal.H_mV);
-      if (den <= 0) return 100;
-      return (uint8_t) constrain(50 + num / den, 50, 100);
-    }
-  } else {
-    // Linear E->F
-    int32_t num = (int32_t)(v_line - cal.E_mV) * 100;
-    int32_t den = (int32_t)(cal.F_mV - cal.E_mV);
-    if (den <= 0) return 0;
-    return (uint8_t) constrain(num / den, 0, 100);
+void drawCenteredStr(int cx, int y, const char* s) {
+  int w = u8g2.getStrWidth(s);
+  u8g2.drawStr(cx - (w / 2), y, s);
+}
+
+void drawFuelOLED(uint8_t fuelPercent, float liters, uint16_t adcAvg) {
+  u8g2.clearBuffer();
+  const int barX = 15, barY = 40, barW = 100, barH = 12;
+
+  u8g2.drawFrame(barX, barY, barW, barH);
+  int fillW = (barW * fuelPercent) / 100;
+  u8g2.drawBox(barX, barY, fillW, barH);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(barX - 10, barY + barH, "E");
+  u8g2.drawStr(barX + barW + 4, barY + barH, "F");
+
+  for (int i = 1; i < 4; i++) {
+    int notchX = barX + (barW * i) / 4;
+    u8g2.drawLine(notchX, barY - 4, notchX, barY);
   }
+
+  const int halfX = barX + barW / 2;
+  drawCenteredStr(halfX, barY - 6, "1/2");
+
+  char buf[16];
+  sprintf(buf, "%d%%", fuelPercent);
+  drawCenteredStr(halfX, 20, buf);
+
+  sprintf(buf, "%d L", (int)(liters + 0.5));
+  drawCenteredStr(halfX, barY + barH + 10, buf);
+
+  sprintf(buf, "ADC:%u", adcAvg);
+  u8g2.drawStr(80, 10, buf);
+
+  if (fuelPercent < 17 && ((millis()/500)%2==0)) {
+    u8g2.drawXBMP(2, 2, 16, 16, fuelPump16x16_bits);
+  }
+
+  u8g2.sendBuffer();
 }
 
-void drawFuelOLED(uint8_t fuelPercent, uint16_t adcAvg) {
-  u8g.firstPage();
-  do {
-    // Title
-    u8g.setFont(u8g_font_6x13B);
-    u8g.drawStr(0, 10, "Fuel Gauge");
-
-    // Bar graph
-    int barWidth = map(fuelPercent, 0, 100, 0, 120);
-    u8g.drawFrame(0, 20, 128, 20);
-    u8g.drawBox(0, 20, barWidth, 20);
-
-    // Percent text
-    char buf[16];
-    sprintf(buf, "%3d%%", fuelPercent);
-    u8g.drawStr(0, 55, buf);
-
-    // Raw ADC debug
-    sprintf(buf, "ADC:%u", adcAvg);
-    u8g.drawStr(64, 55, buf);
-
-  } while (u8g.nextPage());
+// ---------- Menu ----------
+void printCommandMenu() {
+  Serial.println(F("---- Command Menu ----"));
+  Serial.println(F(" e   = set Empty (0 L)"));
+  Serial.println(F(" h   = set Half  (30 L)"));
+  Serial.println(F(" f   = set Full  (60 L)"));
+  Serial.println(F(" lNN = set current as NN liters"));
+  Serial.println(F(" !e  = clear user-set Empty (0 L)"));
+  Serial.println(F(" !h  = clear user-set Half  (30 L)"));
+  Serial.println(F(" !f  = clear user-set Full  (60 L)"));
+  Serial.println(F(" !NN = clear user-set anchor at NN liters"));
+  Serial.println(F(" p   = print calibration points"));
+  Serial.println(F(" x   = reset calibration (Honda defaults)"));
+  Serial.println(F(" ?   = show this help menu"));
+  Serial.println(F("------------------------"));
 }
 
-void printStatus() {
-  Serial.println(F("---- Calibration Status ----"));
-  Serial.print(F("E anchor = ")); Serial.print(cal.E_mV); Serial.println(F(" mV"));
-  Serial.print(F("H anchor = ")); Serial.print(cal.H_mV); Serial.println(F(" mV"));
-  Serial.print(F("F anchor = ")); Serial.print(cal.F_mV); Serial.println(F(" mV"));
-  Serial.print(F("Flags = ")); Serial.println(cal.flags, BIN);
-  Serial.print(F("Valid = ")); Serial.println(cal.valid, HEX);
-  Serial.print(F("Current Vcc = ")); Serial.print(ADC_REF_mV); Serial.println(F(" mV"));
+void printCalibration() {
+  Serial.println(F("---- Calibration Points ----"));
+  for (uint8_t i=0; i<cal.count; i++) {
+    Serial.print(i); Serial.print(F(": "));
+    Serial.print(cal.points[i].mV); Serial.print(F(" mV = "));
+    Serial.print(cal.points[i].liters); Serial.print(F(" L  "));
+    Serial.println(cal.points[i].isDefault ? F("[DEFAULT]") : F("[SET]"));
+  }
+  Serial.println(F("-----------------------------"));
 }
 
-void printDefaults() {
-  Serial.println(F("---- Default Model Anchors ----"));
-  Serial.print(F("E (24Ω) = ")); Serial.print(ohmsToLine_mV(R_E_OHMS)); Serial.println(F(" mV"));
-  Serial.print(F("H (152Ω) = ")); Serial.print(ohmsToLine_mV(R_H_OHMS)); Serial.println(F(" mV"));
-  Serial.print(F("F (277Ω) = ")); Serial.print(ohmsToLine_mV(R_F_OHMS)); Serial.println(F(" mV"));
-}
+// ---------- Setup / Loop ----------
+unsigned long lastSerialPrint = 0;
 
-// Simulate targeting a % fuel (demo only)
-void fitCurrentToTarget(uint8_t targetPercent) {
-  Serial.print(F("Simulating target fuel = "));
-  Serial.print(targetPercent);
-  Serial.println(F("% (no physical output driven)"));
-}
-
-// -------------- Setup / Loop --------------
 void setup(){
   Serial.begin(115200);
-
-  // Measure and store initial Vcc
+  u8g2.begin();
   ADC_REF_mV = readVcc_mV();
-  Serial.print(F("Boot Vcc = "));
-  Serial.print(ADC_REF_mV);
-  Serial.println(F(" mV"));
 
   loadCal();
-  Serial.println(F("Prelude fuel sender tap via 47k/22k + 100nF. H is OPTIONAL (linear if unset)."));
-  Serial.println(F("Commands: e/h/f set live; !e/!h/!f clear; d derive unset; p print; O defaults; tNN target %; V show Vcc."));
-  printStatus();
+  if (cal.count < 2) {
+    loadHondaDefaults(); // preload if nothing stored
+  }
+  printCalibration();
+  printCommandMenu();
 }
 
 void loop(){
   static unsigned long lastUpdate=0;
   unsigned long now=millis();
 
-  // Refresh measured Vcc once per second
-  static unsigned long lastVccCheck=0;
-  if (now - lastVccCheck >= 1000) {
-    lastVccCheck = now;
-    ADC_REF_mV = readVcc_mV();
-  }
-
   if (now-lastUpdate>=250){
     lastUpdate=now;
 
-    flushLineEndings();
-    while (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\r' || c == '\n' || c == ' ') continue;
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
 
-      if (c=='e'||c=='E'){ 
-        uint16_t adc,v; uint16_t vline=readSenderLine_mV(adc,v);
-        cal.E_mV=vline; cal.flags|=0x01; saveCal();
-        Serial.print(F("Set E anchor = ")); Serial.print(vline); Serial.println(F(" mV (saved)"));
-      }
-      else if (c=='h'||c=='H'){ 
-        uint16_t adc,v; uint16_t vline=readSenderLine_mV(adc,v);
-        cal.H_mV=vline; cal.flags|=0x02; saveCal();
-        Serial.print(F("Set H anchor = ")); Serial.print(vline); Serial.println(F(" mV (saved)"));
-      }
-      else if (c=='f'||c=='F'){ 
-        uint16_t adc,v; uint16_t vline=readSenderLine_mV(adc,v);
-        cal.F_mV=vline; cal.flags|=0x04; saveCal();
-        Serial.print(F("Set F anchor = ")); Serial.print(vline); Serial.println(F(" mV (saved)"));
-      }
-      else if (c=='!'){ char t; if (readNextCharWithTimeout(t)) clearAnchor(t); }
-      else if (c=='d'||c=='D'){ setDefaultsForUnset(); cal.valid=0xA5; saveCal(); Serial.println(F("Re-derived defaults.")); }
-      else if (c=='p'||c=='P'){ printStatus(); }
-      else if (c=='O'){ printDefaults(); }
-      else if (c=='t' || c=='T'){ 
-        char d1,d2; 
-        if (readNextCharWithTimeout(d1) && readNextCharWithTimeout(d2)) {
-          uint8_t tgt=(d1-'0')*10+(d2-'0');
-          fitCurrentToTarget(tgt);
+      if (cmd=="e"){ uint16_t a,v; uint16_t mv=readSenderLine_mV(a,v); addCalibration(mv,0); }
+      else if (cmd=="h"){ uint16_t a,v; uint16_t mv=readSenderLine_mV(a,v); addCalibration(mv,30); }
+      else if (cmd=="f"){ uint16_t a,v; uint16_t mv=readSenderLine_mV(a,v); addCalibration(mv,60); }
+      else if (cmd.startsWith("l")) {
+        int liters = cmd.substring(1).toInt();
+        if (liters>=0 && liters<=TANK_LITERS) {
+          uint16_t a,v; uint16_t mv=readSenderLine_mV(a,v);
+          addCalibration(mv,liters);
         }
-      } 
-      else if (c=='v' || c=='V'){ 
-        Serial.print(F("Measured Vcc = "));
-        Serial.print(ADC_REF_mV);
-        Serial.println(F(" mV"));
       }
-      flushLineEndings();
+      else if (cmd.startsWith("!")) {
+        if (cmd.length() == 2 && isalpha(cmd[1])) {
+          clearAnchorByTag(cmd[1]);
+        } else {
+          int liters = cmd.substring(1).toInt();
+          if (liters >= 0 && liters <= TANK_LITERS) {
+            clearAnchorByLiters(liters);
+          } else {
+            Serial.println(F("Invalid clear target, use !e, !h, !f, or !NN"));
+          }
+        }
+      }
+      else if (cmd=="p") printCalibration();
+      else if (cmd=="x") resetCalibration();
+      else if (cmd=="?") printCommandMenu();
     }
 
     uint16_t adcAvg, vadc_mV;
-    uint16_t v_line=readSenderLine_mV(adcAvg, vadc_mV);
-    uint8_t fuelSmooth=fuelPercentFromLine(v_line);
-    drawFuelOLED(fuelSmooth, adcAvg);
+    uint16_t v_line = readSenderLine_mV(adcAvg, vadc_mV);
+    float liters = litersFromLine(v_line);
+    if (liters<0) liters=0;
+    if (liters>TANK_LITERS) liters=TANK_LITERS;
+    uint8_t fuelPercent = (uint8_t)((liters / TANK_LITERS) * 100.0f + 0.5f);
 
-    heartbeat = !heartbeat;
+    drawFuelOLED(fuelPercent, liters, adcAvg);
 
-    Serial.print(F("ADC=")); Serial.print(adcAvg);
-    Serial.print(F("  Vadc=")); Serial.print(vadc_mV);
-    Serial.print(F(" mV  Line=")); Serial.print(v_line);
-    Serial.print(F(" mV  Fuel=")); Serial.print(fuelSmooth);
-    Serial.println(F("%"));
+    if (now - lastSerialPrint >= 1000) {
+      lastSerialPrint = now;
+      Serial.print(F("ADC=")); Serial.print(adcAvg);
+      Serial.print(F("  Vline=")); Serial.print(v_line);
+      Serial.print(F(" mV  Fuel=")); Serial.print(fuelPercent);
+      Serial.print(F("%  Liters=")); Serial.println((int)(liters+0.5));
+    }
   }
 }
