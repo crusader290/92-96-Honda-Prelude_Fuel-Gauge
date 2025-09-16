@@ -1,123 +1,129 @@
-Honda Prelude Fuel Gauge Replacement – Arduino Nano R4
+# Honda Prelude (BA8) Fuel Gauge Project – Nano R4
 
-A digital replacement for the 1990s Honda Prelude analog fuel gauge, running on an Arduino Nano R4 with a 2.42" OLED.
-Reads the OEM fuel sender through a resistor divider, applies calibration, and displays liters, %, ADC, and a low-fuel warning.
+This project uses an **Arduino Nano R4** to read the factory fuel sender in a 1993 Honda Prelude (BA8, F22A1) and display the fuel level on an OLED.
 
-✨ Features
+---
 
-📟 OLED Display
+## ⚡ Hardware Overview
 
-Fuel level % (top)
+- **Board:** Arduino Nano R4 (Renesas RA4M1, 14-bit ADC)
+- **ADC Range:** 0–5 V (0–16383 counts)  
+  > Important: `analogReadResolution(14);` must be set in `setup()` to enable 14-bit reads.
+- **Fuel Sender Source:** Yellow/Green wire between cluster and tank sender
+- **Ground Reference:** Black wire (chassis ground)
+- **Resistor Divider:** 47k (top) / 10k (bottom)  
+  - Ratio ≈ 0.175  
+  - Keeps the ~0.7–2.1 V sender signal safely in range  
+  - Feeds into Nano R4 **A0** pin (5 V tolerant)
 
-Liters (bottom center)
+---
 
-ADC raw value (top-right)
+## 📈 Calibration (14-bit counts)
 
-Blinking fuel pump icon <17% (~10 L)
+Measured using the 47k/10k divider on Nano R4, sender range ~0.7–2.1 V.  
+Converted into ADC counts (0–16383):
 
-⚡ Honda defaults built-in
+| Liters | ADC Counts |
+|--------|------------|
+| 0      | 410        |
+| 15     | 780        |
+| 30     | 1040       |
+| 45     | 1135       |
+| 60     | 1187       |
 
-Empty = ~0 L @ 620 mV
+Default calibration table in code:
 
-Half = ~30 L @ 1570 mV
+```cpp
+cal.points[0] = {  410,  0, true};   // Empty
+cal.points[1] = {  780, 15, true};   // 1/4
+cal.points[2] = { 1040, 30, true};   // 1/2
+cal.points[3] = { 1135, 45, true};   // 3/4
+cal.points[4] = { 1187, 60, true};   // Full
 
-Full = ~60 L @ 1800 mV
-
-🛠️ Calibration System
-
-User-set anchors [SET] saved in EEPROM (persist after reset)
-
-Defaults [DEFAULT] always available for comparison
-
-Linear interpolation between anchors
-
-Honda curve supported with multiple anchors
-
-🔒 Safe for Nano R4
-
-12-bit ADC (0–4095)
-
-3.3 V reference voltage
-
-Voltage divider (47k / 10k) keeps line <3.3 V
-
-🧩 Hardware
-
-Arduino Nano R4 Minima / WiFi
-
-2.42" OLED (SSD1309 / SSD1306 compatible)
-
-Voltage divider:
-
-R1 = 47kΩ (sender → A0)
-
-R2 = 10kΩ (A0 → GND)
-
-OEM Honda Prelude fuel sender wire tapped
-
-⚠️ Ensure sender line voltage at A0 never exceeds 3.3 V.
-
-💻 Commands
-Calibration
-e       Set EMPTY  (0 L)
-h       Set HALF   (30 L)
-f       Set FULL   (60 L)
-lNN     Set current = NN liters (e.g. l10 = 10 L)
-
-Clear (only clears [SET] anchors)
-!e      Clear user-set Empty   (0 L)
-!h      Clear user-set Half    (30 L)
-!f      Clear user-set Full    (60 L)
-!NN     Clear user-set at NN L (e.g. !10 = clear 10 L anchor)
-
-Utility
-p       Print all calibration points ([DEFAULT] + [SET])
-x       Reset → load Honda defaults
-?       Show help menu
-
-🔧 Workflow
-
-Reset defaults
-
-> x
-Calibration reset to Honda defaults.
-0: 620 mV  = 0 L   [DEFAULT]
-1: 1570 mV = 30 L  [DEFAULT]
-2: 1800 mV = 60 L  [DEFAULT]
+> EEPROM stores calibration. If invalid, defaults above are loaded.
 
 
-Add real anchors while driving
 
-Near empty → e
 
-Half tank → h
+---
 
-Full tank → f
+🛠 Wiring
 
-Optional fine-tuning → l10, l15, l45, etc.
+Tank Connector (rear, at pump/sender):
 
-Check calibration
+Yellow/Green → Sender signal → 47k/10k divider → A0
 
-p → Lists all anchors
+Black → Ground → Divider + Nano GND
 
-[SET] always overrides [DEFAULT] in calculations
 
-Clear mistakes
+Cluster Connector (front, behind dash):
 
-Wrong anchor? → !NN (e.g. !10)
+Yellow/Green → Sender signal (same run as tank)
 
-🚨 Notes
+Black → Ground
 
-Needs at least 2 anchors for valid interpolation.
+Yellow/Black → 12 V IGN feed (⚠️ do NOT use for ADC)
 
-More anchors = more accurate Honda non-linear curve.
 
-Defaults alone = “ballpark accurate,” especially mid/full.
+You may tap either the tank plug or the cluster harness (easier if you’re already behind the dash).
 
-Near empty is least accurate without calibration → recommended to set e at low fuel light.
 
-Unplugged sender → may float ADC → add a pull-down resistor or code check for open circuit.
+---
 
-📜 License
+🔧 Code Notes
 
-MIT License — free to use, modify, and share.
+1. Force 14-bit ADC mode:
+
+analogReadResolution(14);   // Nano R4, 0–16383 counts
+
+
+2. Use averaged ADC reads for stability:
+
+long sum = 0;
+for (int i = 0; i < 16; i++) sum += analogRead(A0);
+int adcValue = sum / 16;
+
+
+3. Clamp readings:
+
+adcValue = constrain(adcValue, 0, 16383);
+
+
+
+
+---
+
+📟 Display
+
+OLED is driven via U8g2, showing fuel level in liters.
+Example output:
+
+Fuel: 32 L
+
+
+---
+
+⚠️ Safety
+
+Don’t tap the +12 V IGN feed — it won’t show fuel level and may damage the Nano.
+
+Always confirm wire color with a multimeter before tapping (voltage should vary with tank level).
+
+Add a series resistor (1–2 kΩ) before A0 and/or a TVS diode for surge protection if desired.
+
+
+
+---
+
+✅ Status
+
+ADC proven working (analogReadResolution(14) required).
+
+Calibration tested for 47k/10k divider.
+
+Default EEPROM setup included.
+
+Safe tap points identified: Yellow/Green sender wire at tank or cluster.
+
+
+---
