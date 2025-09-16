@@ -1,4 +1,4 @@
-# Honda Prelude (BA8) Fuel Gauge Project – Nano R4
+# Honda Prelude 4th Gen (92-96) Fuel Gauge Project – Nano R4
 
 This project uses an **Arduino Nano R4** to read the factory fuel sender in a 1993 Honda Prelude (BA8, F22A1) and display the fuel level on an OLED.
 
