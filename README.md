@@ -39,10 +39,9 @@ cal.points[1] = {  780, 15, true};   // 1/4
 cal.points[2] = { 1040, 30, true};   // 1/2
 cal.points[3] = { 1135, 45, true};   // 3/4
 cal.points[4] = { 1187, 60, true};   // Full
+```
 
 > EEPROM stores calibration. If invalid, defaults above are loaded.
-
-
 
 
 ---
